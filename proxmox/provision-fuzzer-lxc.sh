@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 #
 # Provisions an Ubuntu 24.04 wtf fuzzer node as an LXC container on a Proxmox
-# VE host. Lighter and faster to spin up than the VM variant, but cannot use
-# the kvm backend (no /dev/kvm passthrough by default). Use this for
-# bochscpu-backend fuzz clients only; use provision-fuzzer-node.sh for the
-# master and any kvm-backend clients.
+# VE host.
+#
+# Two modes:
+#   default          unprivileged container, bochscpu backend only.
+#   --kvm            privileged container with /dev/kvm bind-mounted, so the
+#                    wtf kvm backend works at native (non-nested) speed.
 #
 # Usage:
-#   ./provision-fuzzer-lxc.sh \
-#       --ctid 9201 \
-#       --hostname wtf-fuzz-lxc-01 \
-#       --storage local-lvm \
-#       --bridge vmbr0
+#   # bochscpu-only worker:
+#   ./provision-fuzzer-lxc.sh --ctid 9201 --hostname wtf-fuzz-lxc-01
+#
+#   # kvm-capable worker (privileged, /dev/kvm passed through):
+#   ./provision-fuzzer-lxc.sh --ctid 9202 --hostname wtf-fuzz-kvm-01 --kvm
 #
 # Re-run with different --ctid for additional containers. First run downloads
 # the Ubuntu LXC template automatically.
@@ -33,9 +35,10 @@ WTF_REPO="https://github.com/0vercl0k/wtf.git"
 WTF_BRANCH="main"
 TEMPLATE_NAME="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
 UNPRIVILEGED=1
+PASS_KVM=0
 
 usage() {
-    sed -n '2,18p' "$0"
+    sed -n '2,21p' "$0"
     exit "${1:-0}"
 }
 
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --user)              CI_USER=$2; shift 2 ;;
         --wtf-repo)          WTF_REPO=$2; shift 2 ;;
         --wtf-branch)        WTF_BRANCH=$2; shift 2 ;;
+        --kvm)               PASS_KVM=1; UNPRIVILEGED=0; shift ;;
         --privileged)        UNPRIVILEGED=0; shift ;;
         -h|--help)           usage 0 ;;
         *) echo "unknown flag: $1" >&2; usage 1 ;;
@@ -74,6 +78,10 @@ if [[ ! -f "$SSH_KEY" ]]; then
 fi
 if pct status "$CTID" >/dev/null 2>&1; then
     echo "error: container $CTID already exists" >&2
+    exit 1
+fi
+if [[ "$PASS_KVM" == "1" && ! -e /dev/kvm ]]; then
+    echo "error: --kvm requested but /dev/kvm doesn't exist on the host" >&2
     exit 1
 fi
 
@@ -97,6 +105,23 @@ pct create "$CTID" "$TEMPLATE_REF" \
     --onboot 0 \
     --ssh-public-keys "$SSH_KEY" \
     --start 0
+
+# Pass /dev/kvm through to the container. Prefer the modern `--dev0` flag
+# (Proxmox VE 8.2+); fall back to raw lxc.* config for older versions.
+if [[ "$PASS_KVM" == "1" ]]; then
+    if pct set "$CTID" --dev0 /dev/kvm 2>/dev/null; then
+        echo "passed /dev/kvm via --dev0"
+    else
+        KVM_MAJMIN=$(stat -c '%t:%T' /dev/kvm)
+        KVM_MAJOR=$((16#${KVM_MAJMIN%:*}))
+        KVM_MINOR=$((16#${KVM_MAJMIN#*:}))
+        cat >> "/etc/pve/lxc/${CTID}.conf" <<EOF
+lxc.cgroup2.devices.allow: c ${KVM_MAJOR}:${KVM_MINOR} rwm
+lxc.mount.entry: /dev/kvm dev/kvm none bind,create=file,optional
+EOF
+        echo "passed /dev/kvm via raw lxc.* config (major=${KVM_MAJOR}, minor=${KVM_MINOR})"
+    fi
+fi
 
 pct start "$CTID"
 
@@ -123,6 +148,20 @@ pct exec "$CTID" -- bash -euxc "
     chmod 0440 /etc/sudoers.d/90-${CI_USER}
 "
 
+if [[ "$PASS_KVM" == "1" ]]; then
+    # Make sure the kvm group exists with the host gid and that the wtf user
+    # is in it, so wtf can use /dev/kvm without sudo.
+    HOST_KVM_GID=$(stat -c '%g' /dev/kvm)
+    pct exec "$CTID" -- bash -euxc "
+        if ! getent group kvm >/dev/null; then
+            groupadd -g ${HOST_KVM_GID} kvm
+        else
+            groupmod -g ${HOST_KVM_GID} kvm || true
+        fi
+        usermod -aG kvm ${CI_USER}
+    "
+fi
+
 pct exec "$CTID" -- sudo -u "$CI_USER" -H bash -lc "
     cd ~ && git clone --branch '$WTF_BRANCH' '$WTF_REPO' wtf
     cd ~/wtf/src/build && CXX=clang++ CC=clang ./build-release.sh
@@ -133,6 +172,13 @@ IP=$(pct exec "$CTID" -- bash -lc "ip -4 -o addr show eth0 | awk '{print \$4}' |
 echo
 echo "container $CTID ('$HOSTNAME') ready."
 echo "ssh ${CI_USER}@${IP}"
-echo
-echo "note: this container cannot use the kvm backend. Run fuzz clients with"
-echo "      --backend=bochscpu (the wtf default)."
+if [[ "$PASS_KVM" == "1" ]]; then
+    echo
+    echo "kvm backend enabled. /dev/kvm is bind-mounted from the host; ${CI_USER}"
+    echo "is in the kvm group. Verify inside the CT: 'ls -l /dev/kvm' and"
+    echo "'wtf fuzz --backend=kvm ...'."
+else
+    echo
+    echo "note: this container cannot use the kvm backend. Run fuzz clients with"
+    echo "      --backend=bochscpu (the wtf default)."
+fi

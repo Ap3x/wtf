@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #
-# Starts a wtf fuzz client. Run on a Proxmox-provisioned fuzzer VM. Points at
-# the master by IP; defaults to localhost. With --backend=kvm this needs to be
-# run as root (or with CAP_SYS_RAWIO + /dev/kvm access).
+# Starts a wtf fuzz client. Run on a Proxmox-provisioned fuzzer VM or LXC.
+# Points at the master by IP.
+#
+# Backend notes:
+#   --backend=kvm in a nested-KVM VM:   needs sudo (PMU MSR access).
+#   --backend=kvm in an LXC w/ --kvm:   no sudo (wtf user is in kvm group).
+#   --backend=bochscpu (default):       no sudo, works anywhere.
 #
 # Usage:
-#   ./start-fuzz.sh <target-name> <master-ip> [--backend=kvm|bochscpu|whv] [extra wtf args...]
+#   ./start-fuzz.sh <target-name> <master-ip> [--backend=kvm|bochscpu] [wtf args...]
 # Example:
 #   ./start-fuzz.sh hevd 10.0.0.50 --backend=kvm --limit 10000000
 
