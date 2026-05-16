@@ -1,0 +1,48 @@
+#cloud-config
+# Cloud-init for an Ubuntu 24.04 wtf fuzzer node. The provision script
+# substitutes @@VARS@@ before installing this as a Proxmox snippet.
+hostname: wtf-fuzzer
+manage_etc_hosts: true
+
+package_update: true
+package_upgrade: true
+packages:
+  - build-essential
+  - clang
+  - clang-tools
+  - lld
+  - cmake
+  - ninja-build
+  - git
+  - curl
+  - ca-certificates
+  - python3
+  - python3-pip
+  - python3-venv
+  - qemu-guest-agent
+  - pkg-config
+  - libssl-dev
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  # Grant the fuzz user access to /dev/kvm for the kvm backend.
+  - usermod -aG kvm @@CI_USER@@
+  - sudo -u @@CI_USER@@ -H bash -lc 'cd ~ && git clone --branch @@WTF_BRANCH@@ @@WTF_REPO@@ wtf'
+  - sudo -u @@CI_USER@@ -H bash -lc 'cd ~/wtf/src/build && CXX=clang++ CC=clang ./build-release.sh'
+  - sudo -u @@CI_USER@@ -H bash -lc 'mkdir -p ~/wtf/targets'
+
+write_files:
+  - path: /etc/security/limits.d/99-wtf.conf
+    content: |
+      *    soft    nofile    1048576
+      *    hard    nofile    1048576
+      *    soft    memlock   unlimited
+      *    hard    memlock   unlimited
+  - path: /etc/sysctl.d/99-wtf.conf
+    content: |
+      # Disable ASLR on the host so reproducer traces are stable.
+      kernel.randomize_va_space = 0
+      # KVM perf-counter access for the kvm backend's PMI-based timeout.
+      kernel.perf_event_paranoid = -1
+
+final_message: "wtf fuzzer node ready. clone the target into ~/wtf/targets and run scripts/start-master.sh or start-fuzz.sh."
