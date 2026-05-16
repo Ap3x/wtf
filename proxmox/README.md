@@ -11,16 +11,30 @@ or inside the guests it provisions. No Proxmox API token required.
 
 ```
 proxmox/
-├── provision-fuzzer-node.sh      # builds an Ubuntu template + clones fuzzer nodes
+├── provision-fuzzer-node.sh      # builds an Ubuntu VM template + clones fuzzer nodes (KVM-capable)
+├── provision-fuzzer-lxc.sh       # provisions an Ubuntu LXC container fuzzer (bochscpu only)
 ├── cloud-init/
 │   └── fuzzer-user-data.yaml     # cloud-init that builds wtf inside the fuzzer VM
 └── scripts/
-    ├── start-master.sh           # run on the master VM
-    └── start-fuzz.sh             # run on each fuzz-client VM
+    ├── start-master.sh           # run on the master VM/CT
+    └── start-fuzz.sh             # run on each fuzz-client VM/CT
 ```
 
 The Windows target VM is provisioned manually (see step 1 below); the
 fuzzer nodes are automated.
+
+### VM vs LXC for fuzzer nodes
+
+| | VM (`provision-fuzzer-node.sh`) | LXC (`provision-fuzzer-lxc.sh`) |
+| --- | --- | --- |
+| Backend | `bochscpu` **and** `kvm` | `bochscpu` only |
+| Boot time | ~minutes (apt + build on first boot) | ~seconds (apt + build runs synchronously) |
+| RAM overhead | full guest kernel | shares host kernel |
+| Isolation | strong (separate kernel) | weaker (shared kernel, namespaces) |
+| Best for | master node, kvm-backend clients | many lightweight bochscpu clients |
+
+Mix both: VM for the master + a couple of kvm-backend workers, LXC for a
+swarm of bochscpu workers.
 
 ## Prerequisites on the Proxmox host
 
@@ -125,12 +139,31 @@ your own fork.
 ./provision-fuzzer-node.sh --clone --vmid 9100 --name wtf-master \
     --cores 2 --memory 4096
 
-# fuzz clients — give them lots of cores; one wtf fuzz process per core
+# fuzz clients (VM) — give them lots of cores; one wtf fuzz process per core
 ./provision-fuzzer-node.sh --clone --vmid 9101 --name wtf-fuzz-01 \
     --cores 16 --memory 16384
 ./provision-fuzzer-node.sh --clone --vmid 9102 --name wtf-fuzz-02 \
     --cores 16 --memory 16384
 ```
+
+### Alternative: LXC fuzz clients (bochscpu only)
+
+For bochscpu-backend workers you can use LXC instead. The script provisions
+each container synchronously (template fetch → `pct create` → apt install →
+`build-release.sh`) and prints the IP when wtf is built:
+
+```sh
+./provision-fuzzer-lxc.sh --ctid 9201 --hostname wtf-fuzz-lxc-01 \
+    --cores 8 --memory 8192
+./provision-fuzzer-lxc.sh --ctid 9202 --hostname wtf-fuzz-lxc-02 \
+    --cores 8 --memory 8192
+```
+
+The container is unprivileged by default with `nesting=1` set (needed so
+apt can do its overlayfs/unshare dance). `/dev/kvm` is **not** passed
+through, so fuzz clients in these containers must run with the default
+bochscpu backend — drop the `--backend=kvm` flag in `start-fuzz.sh` and
+don't `sudo` it.
 
 ## 4. Run the fuzzing job
 
@@ -160,10 +193,12 @@ Windows-only and not usable from Linux fuzzer nodes.
   `--cpu x86-64-v3`) on both `provision-*` scripts.
 - **One vCPU only on the target.** wtf snapshots single-CPU state. Don't
   bump `--cores` on the Windows VM.
-- **Nested virtualization.** Fuzzer nodes use `/dev/kvm` from inside the
+- **Nested virtualization.** VM fuzzer nodes use `/dev/kvm` from inside the
   Proxmox guest, which requires nested virt enabled on the Proxmox host
   (`echo 'options kvm-intel nested=Y' > /etc/modprobe.d/kvm-intel.conf`,
-  reboot, verify with `cat /sys/module/kvm_intel/parameters/nested`).
+  reboot, verify with `cat /sys/module/kvm_intel/parameters/nested`). LXC
+  fuzzer nodes don't need nested virt because they can't use the kvm
+  backend in the first place.
 - **Snapshot transfer.** `mem.dmp` is the size of guest RAM (4GB here).
   Use `rsync` with `-z` if your fuzzer nodes are on a different host.
 - **Coverage breakpoints.** For the `kvm`/`whv` backends you need a `.cov`
