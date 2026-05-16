@@ -11,7 +11,6 @@ or inside the guests it provisions. No Proxmox API token required.
 
 ```
 proxmox/
-├── provision-windows-target.sh   # creates the Windows snapshot-source VM
 ├── provision-fuzzer-node.sh      # builds an Ubuntu template + clones fuzzer nodes
 ├── cloud-init/
 │   └── fuzzer-user-data.yaml     # cloud-init that builds wtf inside the fuzzer VM
@@ -19,6 +18,9 @@ proxmox/
     ├── start-master.sh           # run on the master VM
     └── start-fuzz.sh             # run on each fuzz-client VM
 ```
+
+The Windows target VM is provisioned manually (see step 1 below); the
+fuzzer nodes are automated.
 
 ## Prerequisites on the Proxmox host
 
@@ -32,21 +34,56 @@ proxmox/
   https://github.com/virtio-win/virtio-win-pkg-scripts.
 - Your SSH public key at `~/.ssh/id_ed25519.pub` (or pass `--ssh-key`).
 
-## 1. Provision the Windows target VM
+## 1. Create the Windows target VM (manual)
+
+Create this VM yourself through the Proxmox UI (Datacenter → Create VM) or
+`qm` on the host. The settings that matter for wtf:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| OS type | Microsoft Windows 11/2019/2022 | matches your install ISO |
+| Machine | `q35` | required for OVMF / modern Windows |
+| BIOS | `OVMF (UEFI)` + EFI disk | Windows 11 needs UEFI + Secure Boot |
+| CPU type | `host` (or a fixed model like `x86-64-v3`) | snapshot CPUID must match the fuzzer node CPU |
+| Sockets / Cores | **1 / 1** | wtf snapshots single-CPU state — do not bump this |
+| Memory | 4096 MiB, ballooning off | wtf README recommendation |
+| SCSI controller | `VirtIO SCSI single` | |
+| Disk | 64 GiB VirtIO SCSI, discard on, iothread on | |
+| Network | `virtio`, bridge `vmbr0` | |
+| CD-ROM 1 | your Windows ISO | |
+| CD-ROM 2 | `virtio-win.iso` | load storage driver during install |
+| QEMU Agent | enabled | |
+| Tablet pointer | disabled | reduces snapshot churn |
+
+### Add a COM1 serial port for KD (required for kernel debugging)
+
+wtf takes the snapshot from a debugger session, so you need a serial port
+exposed on the VM and reachable from a debugger. Add it after the VM is
+created:
 
 ```sh
-./provision-windows-target.sh \
-    --vmid 9000 \
-    --name wtf-win-target \
-    --iso local:iso/Win11.iso \
-    --virtio-iso local:iso/virtio-win.iso
+qm set <vmid> --serial0 socket
 ```
 
-The script creates a 1-vCPU, 4GB-RAM VM with VirtIO disk + NIC, OVMF, the
-QEMU guest agent enabled, and `COM1` exposed as a host-side Unix socket at
-`/var/run/qemu-server/9000.serial0` (for KD). Start it with `qm start 9000`
-and finish Windows setup in the noVNC console — load the VirtIO storage
-driver from the second CD when the installer asks for a disk.
+Once the VM is started, Proxmox exposes COM1 on the host as a Unix socket
+at `/var/run/qemu-server/<vmid>.serial0`. To attach a debugger from
+another machine, forward it over SSH/TCP:
+
+```sh
+# on the Proxmox host, expose the socket as a TCP listener
+socat TCP-LISTEN:5555,reuseaddr,fork \
+      UNIX-CONNECT:/var/run/qemu-server/<vmid>.serial0
+```
+
+Then connect windbg/kd to `tcp:port=5555,server=<proxmox-host>` (or use
+windbg's `com:pipe,…` over an SSH tunnel).
+
+Inside Windows, enable kernel debugging over COM1 once and reboot:
+
+```
+bcdedit /debug on
+bcdedit /dbgsettings serial debugport:1 baudrate:115200
+```
 
 ### Inside the Windows VM
 
@@ -64,24 +101,6 @@ driver from the second CD when the installer asks for a disk.
    ```
 5. Copy `c:\state\{mem.dmp,regs.json,symbol-store.json}` to the master VM
    under `~/wtf/targets/<your-target>/state/`.
-
-### (Optional) kernel debugging over COM1
-
-If you need to live-debug the kernel while taking the snapshot, the
-provision script wires `COM1` to a host socket. From any Linux box that can
-reach the Proxmox host:
-
-```sh
-ssh root@<proxmox-host> 'socat - UNIX-CONNECT:/var/run/qemu-server/9000.serial0' \
-    | windbg-equivalent
-```
-
-…and inside Windows:
-
-```
-bcdedit /debug on
-bcdedit /dbgsettings serial debugport:1 baudrate:115200
-```
 
 ## 2. Build the fuzzer template (once)
 
